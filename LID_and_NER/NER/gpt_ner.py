@@ -7,97 +7,108 @@ from pathlib import Path
 from tqdm import tqdm
 import re
 
+with open("prompts/ner_prompt.txt", "r", encoding="utf-8") as file:
+    system_prompt = file.read()
+
 #Collect text posts from selected dataset
-DATASET = "dataset_name"
+DATASET = "../data_input/cleaned_annotated_dataset.csv"
 df = pd.read_csv(DATASET)
 
-client=OpenAI(api_key="key")
-
-prompt_text = """Analyze the following text and identify named entities based on the 
-    predefined categories and definitions below. You will be using BIO tags
-    (B- for beginning token of an entity, I- for tokens within the same entity,
-    O for tokens that do not belong to any entity)
-
-    1. B-PER / I-PER: Person. Includes real or fictional. 
-    2. B-ORG / I-ORG: Organization. Companies, institutions, corporations, 
-    etc. Context should support that token refers to an organization (e.g., Facebook 
-    as an organization vs. Facebook as the website application).
-    3. B-LOC / I-LOC: Location.
-    4. B-GROUP / I-GROUP: Group. Sports teams, music bands, etc.
-    5. B-PROD / I-PROD: Product. Devices, medicine, websites, etc.
-    6. B-TITLE / I-TITLE: Title. Titles of movies, books, TV shows, songs, etc.
-    7. B-EVENT / I-EVENT: Event. Does not include holidays.
-    8. B-TIME / I-TIME: Time. Months, days of the week, seasons, holidays, etc.
-    9. B-OTHER / I-OTHER: Other.
-    10. O: Non-entity token.
-
-    You must split the text into words exactly by spaces. 
-    Return a JSON array of objects, where each object has "token" and "label".
-    Output the response and nothing else.
-
-    Text: "George lived in Washington."
-    Output: 
-    [
-    {"token": "George", "label": "B-PER"},
-    {"token": "lived", "label": "O"},
-    {"token": "in", "label": "O"},
-    {"token": "Washington.", "label": "B-LOC"}
-    ]
-    """
+client = OpenAI(api_key="key")
 
 #*** NER: GPT4o ***#
 def get_ner_labels(post):
-    prompt = f"""
-    {prompt_text}
-    {post}
-    """
     response = client.responses.create(
         model="gpt-4o",
-        input=prompt
+        instructions=system_prompt,
+        input=post,
+        temperature=0
     )
     return response.output_text
 
-#*** Parse output ***#
-def parse_llm_json_response(raw_response_string):
-    #Clean the string
-    cleaned = raw_response_string.strip()
-    
-    #Extract only the text inside the ```json ... ``` block
-    match = re.search(r'```json\s*(.*?)\s*```', cleaned, re.DOTALL)
-    
-    if match:
-        json_content = match.group(1)
-    else:
-        #Fallback if the LLM occasionally omits the markdown block
-        json_content = cleaned
+def parse_ner_output(result):
+    """
+    Parse model output of the form:
 
-    try:
-        #Parse into a list of dictionaries
-        return json.loads(json_content)
-    except json.JSONDecodeError as e:
-        print(f"Failed to parse JSON string. Error: {e}")
-        return []
+        1|B-ORG
+        2|I-ORG
+        3|O
+
+    Returns a dictionary mapping index -> label.
+    """
+
+    labels = {}
+
+    pattern = re.compile(
+        r"^\s*(\d+)\s*\|\s*(B-PER|I-PER|B-ORG|I-ORG|B-LOC|I-LOC|B-GROUP|I-GROUP|B-PROD|I-PROD|B-TITLE|I-TITLE|B-EVENT|I-EVENT|B-TIME|I-TIME|B-OTHER|I-OTHER|O)\s*$"
+    )
+
+    for line in result.splitlines():
+        line = line.strip()
+
+        match = pattern.match(line)
+
+        if match:
+            idx = int(match.group(1))
+            tag = match.group(2)
+            labels[idx] = tag
+
+    return labels
 
 #***COLLECTING LABELS***#
 all_labels = []
 total_posts = df['doc_id'].nunique()
 
 for doc_id, group in tqdm(df.groupby('doc_id'), total=total_posts, desc="Processing posts"):
-    reconstructed_post = ' '.join(group['token'].tolist())
-    
-    result = get_ner_labels(reconstructed_post)
-    llm_output = parse_llm_json_response(result)
+
+    numbered_tokens = "\n".join(
+        f"{i}: {token}"
+        for i, token in enumerate(group["token"].tolist(), start=1)
+    )    
+
+    result = get_ner_labels(numbered_tokens)
+    label_dict = parse_ner_output(result)
+
+    expected_indices = list(range(1, len(group) + 1))
+    returned_indices = sorted(label_dict.keys())
 
     #Check to ensure exact same number of items as the group is returned
-    if len(llm_output) == len(group):
-        labels = [item['label'] for item in llm_output]
+    if returned_indices == expected_indices:
+        ordered_labels = [
+            label_dict[i]
+            for i in expected_indices
+        ]
+        all_labels.extend(ordered_labels)
+
     else:
         #Fallback if any tokens missed/hallucinated
-        print(f"Warning: Token count mismatch in post {doc_id} (Expected {len(group)}, got {len(llm_output)}). Using fallback alignment.")
-        labels = ['O'] * len(group)
-        
-    all_labels.extend(labels)
 
+        print("\n" + "=" * 80)
+        print(f"WARNING: Index mismatch in post {doc_id}")
+
+        print(f"Expected number of labels: {len(expected_indices)}")
+        print(f"Received number of labels: {len(returned_indices)}")
+
+        missing = sorted(set(expected_indices) - set(returned_indices))
+        extra = sorted(set(returned_indices) - set(expected_indices))
+
+        if missing:
+            print(f"Missing indices: {missing}")
+
+        if extra:
+            print(f"Unexpected indices: {extra}")
+
+        print("\nINPUT:")
+        print(numbered_tokens)
+
+        print("\nRAW MODEL OUTPUT:")
+        print(result)
+
+        print("=" * 80 + "\n")
+
+        # Preserve dataframe alignment
+        all_labels.extend(["UNK"] * len(group))
+        
 df['gpt_ner'] = all_labels
 
 
