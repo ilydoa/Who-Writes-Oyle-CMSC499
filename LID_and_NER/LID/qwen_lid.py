@@ -15,7 +15,7 @@ from openai import (
     InternalServerError,
 )
 
-with open("lid_prompt.txt", "r", encoding="utf-8") as file:
+with open("prompts/lid_prompt.txt", "r", encoding="utf-8") as file:
     system_prompt = file.read()
 
 DATASET = "dataset_path"
